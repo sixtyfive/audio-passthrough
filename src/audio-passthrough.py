@@ -1,221 +1,416 @@
-#!/usr/bin/env python3
 """
-ALSA Audio Monitor - Command-line program for monitoring audio input and managing pipes.
-
-This program monitors the IEC958 In input on ALSA soundcard ICUSBAUDIO7D for audio signals,
-and creates/destroys audio pipes to snd_rpi_merus_amp based on signal presence and silence detection.
+Main audio monitoring class that handles signal detection and pipe management.
 """
 
-import argparse
 import logging
-import signal
-import sys
 import time
-from audio_monitor import AudioMonitor
+import threading
+import subprocess
+import pyaudio
+import numpy as np
+from typing import Optional
 from config import *
+from utils import (
+    get_alsa_devices, 
+    find_device_card_number, 
+    create_audio_pipe, 
+    destroy_audio_pipe, 
+    calculate_rms,
+    set_pcm_input_source,
+    test_alsa_device_access,
+    AudioPipeProcess
+)
 
-# Global monitor instance for signal handling
-monitor = None
+logger = logging.getLogger(__name__)
 
-def setup_logging(log_level: str = LOG_LEVEL):
+class AudioMonitor:
     """
-    Setup logging configuration.
-    
-    Args:
-        log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
+    Main class for monitoring audio input and managing audio pipes.
     """
-    logging.basicConfig(
-        level=getattr(logging, log_level.upper()),
-        format=LOG_FORMAT,
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-        ]
-    )
-
-def signal_handler(signum, frame):
-    """
-    Handle termination signals gracefully.
     
-    Args:
-        signum: Signal number
-        frame: Current stack frame
-    """
-    global monitor
-    
-    print(f"\nReceived signal {signum}, shutting down...")
-    
-    if monitor:
-        monitor.stop()
-    
-    sys.exit(0)
-
-def print_status(monitor: AudioMonitor):
-    """
-    Print current status of the audio monitor.
-    
-    Args:
-        monitor: AudioMonitor instance
-    """
-    status = monitor.get_status()
-    
-    print(f"\n{'='*60}")
-    print(f"Audio Monitor Status")
-    print(f"{'='*60}")
-    print(f"Running: {'Yes' if status['is_running'] else 'No'}")
-    print(f"Pipe Active: {'Yes' if status['is_pipe_active'] else 'No'}")
-    print(f"Source Device: {status['source_device']}")
-    print(f"Destination Device: {status['destination_device']}")
-    
-    if status['last_signal_time']:
-        last_signal_ago = time.time() - status['last_signal_time']
-        print(f"Last Signal: {last_signal_ago:.1f} seconds ago")
-    
-    if status['silence_duration'] > 0:
-        print(f"Silence Duration: {status['silence_duration']:.1f} seconds")
-        print(f"Time Until Timeout: {status['time_until_timeout']:.1f} seconds")
-    
-    print(f"{'='*60}")
-
-def main():
-    """
-    Main function for the ALSA audio monitor.
-    """
-    global monitor
-    
-    parser = argparse.ArgumentParser(
-        description="Monitor ALSA audio input and manage audio pipes based on signal detection"
-    )
-    
-    parser.add_argument(
-        '--log-level',
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-        default=LOG_LEVEL,
-        help='Set logging level'
-    )
-    
-    parser.add_argument(
-        '--status-interval',
-        type=float,
-        default=10.0,
-        help='Interval in seconds for status updates (0 to disable)'
-    )
-    
-    parser.add_argument(
-        '--silence-threshold',
-        type=float,
-        default=SILENCE_THRESHOLD,
-        help='RMS threshold below which audio is considered silent'
-    )
-    
-    parser.add_argument(
-        '--signal-threshold',
-        type=float,
-        default=SIGNAL_THRESHOLD,
-        help='RMS threshold above which audio is considered present'
-    )
-    
-    parser.add_argument(
-        '--silence-timeout',
-        type=float,
-        default=SILENCE_TIMEOUT,
-        help='Seconds of silence before destroying pipe'
-    )
-    
-    parser.add_argument(
-        '--test-devices',
-        action='store_true',
-        help='Test device availability and exit'
-    )
-    
-    parser.add_argument(
-        '--simulation',
-        action='store_true',
-        help='Run in simulation mode (no real audio hardware required)'
-    )
-    
-    parser.add_argument(
-        '--skip-device-check',
-        action='store_true',
-        help='Skip hardware device accessibility checks'
-    )
-    
-    parser.add_argument(
-        '--alsa-only',
-        action='store_true',
-        help='Use ALSA tools only for monitoring (no PyAudio)'
-    )
-    
-    args = parser.parse_args()
-    
-    # Setup logging
-    setup_logging(args.log_level)
-    logger = logging.getLogger(__name__)
-    
-    # Update configuration with command-line arguments
-    import config
-    config.SILENCE_THRESHOLD = args.silence_threshold
-    config.SIGNAL_THRESHOLD = args.signal_threshold
-    config.SILENCE_TIMEOUT = args.silence_timeout
-    
-    # Test devices if requested
-    if args.test_devices:
-        from utils import get_alsa_devices, find_device_card_number
+    def __init__(self, simulation_mode=False, skip_device_check=False, alsa_only=False):
+        self.simulation_mode = simulation_mode
+        self.skip_device_check = skip_device_check
+        self.alsa_only = alsa_only
+        self.audio = pyaudio.PyAudio() if not simulation_mode and not alsa_only else None
+        self.stream: Optional[pyaudio.Stream] = None
+        self.pipe_process: Optional[AudioPipeProcess] = None
+        self.monitor_process: Optional[subprocess.Popen] = None
+        self.is_running = False
+        self.is_pipe_active = False
+        self.last_signal_time = time.time()
+        self.silence_start_time = None
+        self.monitor_thread: Optional[threading.Thread] = None
         
-        print("Testing ALSA device availability...")
-        devices = get_alsa_devices()
-        print(f"Available devices: {devices}")
+        # Initialize audio format
+        self.format = pyaudio.paInt16
+        self.channels = CHANNELS
+        self.sample_rate = SAMPLE_RATE
+        self.chunk_size = CHUNK_SIZE
         
-        source_card = find_device_card_number(SOURCE_DEVICE)
-        dest_card = find_device_card_number(DESTINATION_DEVICE)
+        # Simulation variables
+        self.simulation_counter = 0
+        # Signal pattern: 3 seconds signal, 35 seconds silence, 2 seconds signal, 35 seconds silence
+        # At 100ms intervals (MONITORING_INTERVAL = 0.1), this means:
+        # 30 readings for signal (3 seconds), 350 readings for silence (35 seconds)
+        self.simulation_signal_pattern = [True] * 30 + [False] * 350 + [True] * 20 + [False] * 350
         
-        print(f"Source device '{SOURCE_DEVICE}': {'Found (card {})'.format(source_card) if source_card is not None else 'Not found'}")
-        print(f"Destination device '{DESTINATION_DEVICE}': {'Found (card {})'.format(dest_card) if dest_card is not None else 'Not found'}")
+    def initialize_audio_stream(self) -> bool:
+        """
+        Initialize PyAudio stream for monitoring the source device.
         
-        return
-    
-    # Setup signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Create and start monitor
-    monitor = AudioMonitor(simulation_mode=args.simulation, skip_device_check=args.skip_device_check, alsa_only=args.alsa_only)
-    
-    print(f"Starting ALSA Audio Monitor")
-    if args.simulation:
-        print("Running in SIMULATION MODE - no real audio hardware required")
-    print(f"Source: {SOURCE_DEVICE} ({SOURCE_INPUT}) -> {SOURCE_ALSA_DEVICE}")
-    print(f"Destination: {DESTINATION_DEVICE} -> {DESTINATION_ALSA_DEVICE}")
-    print(f"Sample Rate: {SAMPLE_RATE} Hz")
-    print(f"Buffer Size: {BUFFER_SIZE}")
-    print(f"Silence Threshold: {config.SILENCE_THRESHOLD}")
-    print(f"Signal Threshold: {config.SIGNAL_THRESHOLD}")
-    print(f"Silence Timeout: {config.SILENCE_TIMEOUT} seconds")
-    print(f"Press Ctrl+C to stop")
-    
-    if not monitor.start():
-        logger.error("Failed to start audio monitor")
-        sys.exit(1)
-    
-    # Main status loop
-    try:
-        last_status_time = time.time()
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.simulation_mode:
+            logger.info("Running in simulation mode - no audio stream initialization needed")
+            return True
         
-        while True:
-            current_time = time.time()
+        if self.alsa_only:
+            logger.info("Running in ALSA-only mode - using arecord for monitoring")
+            return True
+        
+        try:
+            # Find source device
+            source_card = find_device_card_number(SOURCE_DEVICE)
+            if source_card is None:
+                logger.error(f"Source device {SOURCE_DEVICE} not found")
+                return False
             
-            # Print status at intervals
-            if args.status_interval > 0 and current_time - last_status_time >= args.status_interval:
-                print_status(monitor)
-                last_status_time = current_time
+            # Get device info
+            device_info = None
+            for i in range(self.audio.get_device_count()):
+                info = self.audio.get_device_info_by_index(i)
+                if SOURCE_DEVICE.lower() in info['name'].lower():
+                    device_info = info
+                    break
             
-            time.sleep(1)
+            if device_info is None:
+                logger.warning(f"Could not find PyAudio device for {SOURCE_DEVICE}. Using default input device for simulation.")
+                # Try to use default input device for simulation
+                try:
+                    self.stream = self.audio.open(
+                        format=self.format,
+                        channels=self.channels,
+                        rate=self.sample_rate,
+                        input=True,
+                        frames_per_buffer=self.chunk_size
+                    )
+                    logger.info(f"Initialized default audio stream for simulation")
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to initialize default audio stream: {e}")
+                    return False
             
-    except KeyboardInterrupt:
-        signal_handler(signal.SIGINT, None)
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        monitor.stop()
-        sys.exit(1)
-
-if __name__ == "__main__":
-    main()
+            # Create input stream using the hardware-specific configuration
+            self.stream = self.audio.open(
+                format=self.format,
+                channels=self.channels,
+                rate=self.sample_rate,  # Now 48000 Hz
+                input=True,
+                input_device_index=device_info['index'],
+                frames_per_buffer=self.chunk_size
+            )
+            
+            logger.info(f"Initialized audio stream for {SOURCE_DEVICE}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize audio stream: {e}")
+            return False
+    
+    def read_audio_data(self) -> Optional[np.ndarray]:
+        """
+        Read audio data from the input stream.
+        
+        Returns:
+            Audio data as numpy array, or None if error
+        """
+        if self.simulation_mode:
+            # Generate simulated audio data
+            pattern_index = self.simulation_counter % len(self.simulation_signal_pattern)
+            has_signal = self.simulation_signal_pattern[pattern_index]
+            
+            if has_signal:
+                # Generate audio data with signal (random noise above threshold)
+                audio_data = np.random.randint(-8000, 8000, self.chunk_size, dtype=np.int16)
+            else:
+                # Generate quiet audio data (below threshold)
+                audio_data = np.random.randint(-100, 100, self.chunk_size, dtype=np.int16)
+            
+            self.simulation_counter += 1
+            return audio_data
+        
+        if self.alsa_only:
+            # Use arecord to get audio data (fall back to simulation if not available)
+            try:
+                if self.monitor_process is None or self.monitor_process.poll() is not None:
+                    # Start or restart the monitoring process
+                    cmd = [
+                        'arecord', '-D', SOURCE_ALSA_DEVICE, '-f', 'S16_LE', 
+                        '-r', str(SAMPLE_RATE), '-c', str(CHANNELS), '-t', 'raw'
+                    ]
+                    self.monitor_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
+                # Read chunk of data
+                bytes_to_read = self.chunk_size * self.channels * 2  # 2 bytes per sample
+                raw_data = self.monitor_process.stdout.read(bytes_to_read)
+                
+                if len(raw_data) == bytes_to_read:
+                    audio_data = np.frombuffer(raw_data, dtype=np.int16)
+                    return audio_data
+                else:
+                    return None
+                    
+            except FileNotFoundError:
+                # arecord not available, fall back to simulation
+                logger.warning("arecord not available, falling back to simulation mode")
+                self.simulation_mode = True
+                return self.read_audio_data()  # Recursive call to use simulation mode
+            except Exception as e:
+                logger.error(f"Failed to read audio data using arecord: {e}")
+                return None
+        
+        try:
+            if self.stream is None:
+                return None
+            
+            raw_data = self.stream.read(self.chunk_size, exception_on_overflow=False)
+            audio_data = np.frombuffer(raw_data, dtype=np.int16)
+            return audio_data
+            
+        except Exception as e:
+            logger.error(f"Failed to read audio data: {e}")
+            return None
+    
+    def detect_signal(self, audio_data: np.ndarray) -> bool:
+        """
+        Detect if there's an audio signal present.
+        
+        Args:
+            audio_data: Audio data to analyze
+            
+        Returns:
+            True if signal detected, False if silence
+        """
+        if audio_data is None or len(audio_data) == 0:
+            return False
+        
+        rms = calculate_rms(audio_data)
+        
+        # Use hysteresis to prevent rapid switching
+        if self.is_pipe_active:
+            # If pipe is active, use lower threshold to detect silence
+            return rms > SILENCE_THRESHOLD
+        else:
+            # If pipe is not active, use higher threshold to detect signal
+            return rms > SIGNAL_THRESHOLD
+    
+    def start_pipe(self) -> bool:
+        """
+        Start the audio pipe from source to destination.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.is_pipe_active:
+            return True
+        
+        self.pipe_process = create_audio_pipe(SOURCE_DEVICE, DESTINATION_DEVICE)
+        if self.pipe_process is not None:
+            self.is_pipe_active = True
+            self.last_signal_time = time.time()
+            self.silence_start_time = None
+            logger.info("Audio pipe started")
+            return True
+        
+        return False
+    
+    def stop_pipe(self) -> bool:
+        """
+        Stop the audio pipe.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.is_pipe_active:
+            return True
+        
+        success = destroy_audio_pipe(self.pipe_process)
+        if success:
+            self.pipe_process = None
+            self.is_pipe_active = False
+            self.silence_start_time = None
+            logger.info("Audio pipe stopped")
+        
+        return success
+    
+    def monitor_audio(self):
+        """
+        Main monitoring loop that runs in a separate thread.
+        """
+        logger.info("Starting audio monitoring")
+        
+        while self.is_running:
+            try:
+                # Read audio data
+                audio_data = self.read_audio_data()
+                if audio_data is None:
+                    time.sleep(MONITORING_INTERVAL)
+                    continue
+                
+                # Detect signal
+                has_signal = self.detect_signal(audio_data)
+                current_time = time.time()
+                
+                if has_signal:
+                    # Signal detected
+                    self.last_signal_time = current_time
+                    self.silence_start_time = None
+                    
+                    if not self.is_pipe_active:
+                        logger.info("Audio signal detected, starting pipe")
+                        self.start_pipe()
+                else:
+                    # Silence detected
+                    if self.is_pipe_active:
+                        if self.silence_start_time is None:
+                            self.silence_start_time = current_time
+                            logger.info("Silence detected, starting timeout")
+                        elif current_time - self.silence_start_time > SILENCE_TIMEOUT:
+                            logger.info(f"Silence timeout ({SILENCE_TIMEOUT}s) reached, stopping pipe")
+                            self.stop_pipe()
+                
+                # Check if pipe process is still alive
+                if self.is_pipe_active and self.pipe_process and not self.pipe_process.is_alive():
+                    logger.warning("Audio pipe process died, resetting state")
+                    self.is_pipe_active = False
+                    self.pipe_process = None
+                
+                time.sleep(MONITORING_INTERVAL)
+                
+            except Exception as e:
+                logger.error(f"Error in monitoring loop: {e}")
+                time.sleep(MONITORING_INTERVAL)
+    
+    def start(self) -> bool:
+        """
+        Start the audio monitor.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.is_running:
+            logger.warning("Audio monitor is already running")
+            return True
+        
+        # Check if devices are available (skip check if using direct hardware paths)
+        available_devices = get_alsa_devices()
+        logger.info(f"Available ALSA devices: {available_devices}")
+        
+        # Since we're using direct hardware paths (plughw:1, plughw:4), we can proceed
+        # even if the device names aren't detected through aplay -l
+        if SOURCE_DEVICE not in available_devices:
+            logger.warning(f"Source device {SOURCE_DEVICE} not detected, but proceeding with {SOURCE_ALSA_DEVICE}")
+        
+        if DESTINATION_DEVICE not in available_devices:
+            logger.warning(f"Destination device {DESTINATION_DEVICE} not detected, but proceeding with {DESTINATION_ALSA_DEVICE}")
+        
+        # Test hardware device access (unless skipped)
+        if not self.skip_device_check:
+            logger.info(f"Testing access to hardware devices...")
+            source_accessible = test_alsa_device_access(SOURCE_ALSA_DEVICE, 'capture')
+            dest_accessible = test_alsa_device_access(DESTINATION_ALSA_DEVICE, 'playback')
+            
+            if not source_accessible:
+                logger.error(f"Cannot access source device {SOURCE_ALSA_DEVICE}")
+                return False
+            else:
+                logger.info(f"Source device {SOURCE_ALSA_DEVICE} is accessible")
+            
+            if not dest_accessible:
+                logger.error(f"Cannot access destination device {DESTINATION_ALSA_DEVICE}")
+                return False
+            else:
+                logger.info(f"Destination device {DESTINATION_ALSA_DEVICE} is accessible")
+        else:
+            logger.info(f"Skipping device accessibility checks")
+        
+        # Set the PCM input source to IEC958 In
+        if not set_pcm_input_source(SOURCE_ALSA_DEVICE, SOURCE_INPUT):
+            logger.warning(f"Could not set PCM input source to {SOURCE_INPUT}")
+        
+        # Initialize audio stream
+        if not self.initialize_audio_stream():
+            return False
+        
+        # Start monitoring thread
+        self.is_running = True
+        self.monitor_thread = threading.Thread(target=self.monitor_audio, daemon=True)
+        self.monitor_thread.start()
+        
+        logger.info("Audio monitor started successfully")
+        return True
+    
+    def stop(self):
+        """
+        Stop the audio monitor.
+        """
+        if not self.is_running:
+            return
+        
+        logger.info("Stopping audio monitor")
+        self.is_running = False
+        
+        # Stop any active pipe
+        self.stop_pipe()
+        
+        # Wait for monitoring thread to finish
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.monitor_thread.join(timeout=5)
+        
+        # Clean up audio stream
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+            self.stream = None
+        
+        # Clean up monitoring process
+        if self.monitor_process and self.monitor_process.poll() is None:
+            self.monitor_process.terminate()
+            self.monitor_process.wait()
+            self.monitor_process = None
+        
+        logger.info("Audio monitor stopped")
+    
+    def get_status(self) -> dict:
+        """
+        Get current status of the audio monitor.
+        
+        Returns:
+            Dictionary containing status information
+        """
+        current_time = time.time()
+        
+        status = {
+            'is_running': self.is_running,
+            'is_pipe_active': self.is_pipe_active,
+            'source_device': SOURCE_DEVICE,
+            'destination_device': DESTINATION_DEVICE,
+            'last_signal_time': self.last_signal_time,
+            'silence_duration': 0,
+            'time_until_timeout': 0
+        }
+        
+        if self.is_pipe_active and self.silence_start_time:
+            silence_duration = current_time - self.silence_start_time
+            status['silence_duration'] = silence_duration
+            status['time_until_timeout'] = max(0, SILENCE_TIMEOUT - silence_duration)
+        
+        return status
+    
+    def __del__(self):
+        """Destructor to clean up resources."""
+        self.stop()
+        if hasattr(self, 'audio') and self.audio is not None:
+            self.audio.terminate()
