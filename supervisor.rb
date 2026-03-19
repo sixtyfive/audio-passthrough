@@ -42,11 +42,11 @@ RATE                  = 48_000
 PERIOD_SIZE           = 1024
 NUM_PERIODS           = 2
 
-SILENCE_THRESHOLD      = 0.001  # RMS below this = no S/PDIF signal
+SILENCE_THRESHOLD      = 0.0008 # RMS below this = no S/PDIF signal
 SILENCE_PROBE_DURATION = 1      # seconds per arecord probe
 PROBE_FILE             = "/tmp/spdif_probe.wav"
 
-SPDIF_DEBOUNCE        = 2       # consecutive active reads before switching to JACK
+SPDIF_DEBOUNCE        = 3       # consecutive active reads before switching to JACK
 SNAPCAST_DEBOUNCE     = 3       # consecutive 'playing' reads before switching to Snapcast
 
 # ---------------------------------------------------------------------------
@@ -106,7 +106,7 @@ def start_jack
     "-p", PERIOD_SIZE.to_s,
     "-n", NUM_PERIODS.to_s
   ]
-  # puts '$ '+cmd.join(' ')
+  # log :debug, '$ '+cmd.join(' ')
 
   log_file = File.open(LOG_FILE, "a")
   $jack_pid = spawn(env, *cmd, out: log_file, err: log_file)
@@ -126,10 +126,10 @@ def start_jack
 
   log :info, "Connecting JACK ports"
   cmd = ["jack_connect", "system:capture_1", "system:playback_1"]
-  # puts '$ '+cmd.join(' ')
+  # log :debug, '$ '+cmd.join(' ')
   system(*cmd)
   cmd = ["jack_connect", "system:capture_2", "system:playback_2"]
-  # puts '$ '+cmd.join(' ')
+  # log :debug, '$ '+cmd.join(' ')
   system(*cmd)
   log :info, "JACK pipeline active"
   true
@@ -184,18 +184,17 @@ end
 # Reads trigger_time from the ALSA PCM status file.
 # Returns the value as a string, or nil if unreadable.
 def read_trigger_time
-  File.readlines(CARRIER_STATUS_FILE)
-      .grep(/trigger_time:/)
-      .first
-      &.split
-      &.last
+  t = File.readlines(CARRIER_STATUS_FILE)
+  return true if t.compact.first.strip == 'closed'
+  t = t.grep(/trigger_time:/).first&.split&.last
+  t ? t.to_i : 0
 rescue Errno::ENOENT
-  nil
+  0
 end
 
 # Checks that trigger_time is non-nil and stable across several reads.
 # A real locked S/PDIF clock holds a fixed value; noise/unpowered devices don't.
-def spdif_carrier_stable?(checks: 3, interval: 0.3)
+def spdif_carrier_stable?(checks: SPDIF_DEBOUNCE, interval: 0.3)
   times = (1..checks).map do |i|
     sleep interval unless i == 1
     read_trigger_time
@@ -249,7 +248,7 @@ def run_snapcast_mode
         end
       end
     else
-      log(:info, "S/PDIF signal lost (was #{active_count}) — resetting debounce") if active_count > 0
+      log(:info, "S/PDIF signal lost — resetting debounce") if active_count > 0
       active_count = 0
     end
     # No sleep needed: arecord probe takes SILENCE_PROBE_DURATION seconds itself
@@ -276,8 +275,10 @@ def run_jack_mode
   loop do
     # --- Carrier loss (fast path, checked every iteration) ---
     current_trigger = read_trigger_time
-    if current_trigger != last_trigger
-      log :info, "Carrier loss detected (trigger_time changed) — switching to Snapcast"
+    delta = (last_trigger - current_trigger).magnitude
+    # log :debug, current_trigger
+    if delta > 650
+      log :info, "Carrier loss detected (trigger_time changed by #{delta}) — switching to Snapcast"
       stop_jack
       return
     end
