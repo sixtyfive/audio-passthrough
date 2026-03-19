@@ -46,7 +46,7 @@ SILENCE_THRESHOLD      = 0.001  # RMS below this = no S/PDIF signal
 SILENCE_PROBE_DURATION = 1      # seconds per arecord probe
 PROBE_FILE             = "/tmp/spdif_probe.wav"
 
-SPDIF_DEBOUNCE        = 3       # consecutive active reads before switching to JACK
+SPDIF_DEBOUNCE        = 2       # consecutive active reads before switching to JACK
 SNAPCAST_DEBOUNCE     = 3       # consecutive 'playing' reads before switching to Snapcast
 
 # ---------------------------------------------------------------------------
@@ -193,6 +193,18 @@ rescue Errno::ENOENT
   nil
 end
 
+# Checks that trigger_time is non-nil and stable across several reads.
+# A real locked S/PDIF clock holds a fixed value; noise/unpowered devices don't.
+def spdif_carrier_stable?(checks: 3, interval: 0.3)
+  times = (1..checks).map do |i|
+    sleep interval unless i == 1
+    read_trigger_time
+  end
+  first = times.first
+  return false if first.nil?
+  times.all? { |t| t == first }
+end
+
 # Queries the Snapcast JSON-RPC API and returns true if the default stream is playing.
 def snapcast_playing?
   uri = URI("http://#{SNAPCAST_SERVER}:#{SNAPCAST_PORT}/jsonrpc")
@@ -227,9 +239,14 @@ def run_snapcast_mode
       active_count += 1
       log :info, "S/PDIF signal detected (#{active_count}/#{SPDIF_DEBOUNCE})"
       if active_count >= SPDIF_DEBOUNCE
-        log :info, "S/PDIF stable — switching to JACK"
-        stop_snapcast
-        return
+        if spdif_carrier_stable?
+          log :info, "S/PDIF stable — switching to JACK"
+          stop_snapcast
+          return
+        else
+          log :info, "S/PDIF signal present but carrier unstable — resetting debounce"
+          active_count = 0
+        end
       end
     else
       log(:info, "S/PDIF signal lost (was #{active_count}) — resetting debounce") if active_count > 0
