@@ -1,0 +1,12 @@
+[Unit]
+Description=Audio passthrough from ICUSBAUDIO7D to sndrpimerusamp or Snapcast
+After=network.target sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env ruby /root/audio-passthrough/supervisor.rb
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
